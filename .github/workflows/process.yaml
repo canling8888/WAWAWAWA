@@ -7,6 +7,7 @@ on:
 
 env:
   TZ: Asia/Shanghai
+  # 你自己仓库里已有的环境变量保留
   SUBSCRIBE_CONF: ${{ secrets.SUBSCRIBE_CONF }}
   PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
   REACHABLE: ${{ vars.REACHABLE }}
@@ -35,17 +36,11 @@ jobs:
       - name: Install
         run: pip3 install -r requirements.txt
 
-      # 安装 jq
-      - name: Install jq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
-
-      # 先校验 Secrets 是否存在（不打印值）
+      # ====== 自检：Secrets 存在 ======
       - name: Validate secrets (non-empty)
         env:
-          GIST_LINK: ${{ secrets.GIST_LINK }}
-          GIST_PAT:  ${{ secrets.GIST_PAT }}
+          GIST_LINK: ${{ secrets.GIST_LINK }}   # 必须是 Gist 的 ID（不是 URL）
+          GIST_PAT:  ${{ secrets.GIST_PAT }}    # 需要 Gists: Read & write
         run: |
           set -eux
           test -n "$GIST_LINK" || (echo "GIST_LINK is empty"; exit 1)
@@ -53,56 +48,60 @@ jobs:
           echo "GIST_LINK length: ${#GIST_LINK}"
           echo "GIST_PAT   length: ${#GIST_PAT}"
 
-      # 用 PAT 测试一下能否访问 Gist（200 才算通过）
+      # ====== 自检：PAT 能访问该 Gist（要求 GIST_LINK=ID）======
       - name: Check PAT can access Gist
         env:
           GIST_LINK: ${{ secrets.GIST_LINK }}
           GIST_PAT:  ${{ secrets.GIST_PAT }}
         run: |
           set -eux
-          # 如果你填的是 ID，这里拼出 API；如果你填的是完整 URL，这个请求也会给 404。
-          # 建议 GIST_LINK 填“ID”（链接最后那串）。
-          curl -s -o /dev/null -w "%{http_code}\n" \
+          code=$(curl -s -o /dev/null -w "%{http_code}\n" \
             -H "Authorization: token $GIST_PAT" \
-            "https://api.github.com/gists/$GIST_LINK" | tee /tmp/code
-          code=$(cat /tmp/code)
-          if [ "$code" != "200" ]; then
-            echo "PAT/GIST_LINK check failed, http_code=$code"
-            exit 1
-          fi
+            "https://api.github.com/gists/$GIST_LINK")
+          echo "HTTP $code"
+          [ "$code" = "200" ] || (echo "PAT/GIST_LINK check failed"; exit 1)
 
-      # 生成运行时 config.json，并注入 gist 推送配置
+      # ====== 生成运行时 config.json，注入 Gist 推送配置 ======
       - name: Build runtime config.json (inject push->gist)
         env:
           GIST_LINK: ${{ secrets.GIST_LINK }}
           GIST_PAT:  ${{ secrets.GIST_PAT }}
         run: |
           set -eux
-          # 确保默认配置存在
           test -f subscribe/config/config.default.json
+          python - <<'PY'
+import json, os
+with open('subscribe/config/config.default.json','r',encoding='utf-8') as f:
+    cfg = json.load(f)
 
-          cp subscribe/config/config.default.json config.json
+# 注入 storage -> gist；产物在根目录，文件名为 clash.yaml
+cfg.setdefault('storage', {})
+cfg['storage']['engine'] = 'gist'
+cfg['storage']['base']   = 'https://api.github.com'
+cfg['storage']['domain'] = 'https://gist.github.com'
+cfg['storage']['token']  = os.environ['GIST_PAT']
+cfg['storage']['items']  = {
+    "xxx-clash": {"id": os.environ['GIST_LINK'], "filename": "clash.yaml"}
+}
 
-          jq --arg tok "${GIST_PAT}" --arg id "${GIST_LINK}" '
-            .storage.engine = "gist" |
-            .storage.base   = "https://api.github.com" |
-            .storage.domain = "https://gist.github.com" |
-            .storage.token  = $tok |
-            .storage.items  = {
-              "xxx-clash": { "id": $id, "filename": "clash.yaml" }
-            }
-          ' config.json > config.tmp && mv config.tmp config.json
+with open('config.json','w',encoding='utf-8') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-          echo "==== resolved config (token redacted) ===="
-          sed -E 's/"token"\s*:\s*"[^"]+"/"token":"***"/' config.json
+# 打印（打码 token）
+cfg_mask = json.loads(json.dumps(cfg))
+cfg_mask['storage']['token'] = '***'
+print(json.dumps(cfg_mask, ensure_ascii=False, indent=2))
+PY
 
-      # 真正运行脚本（显式携带 config）
+      # ====== 运行脚本（使用 SUBSCRIBE_CONF + -c，而非 --config）======
       - name: Process
+        env:
+          SUBSCRIBE_CONF: config.json   # 告诉脚本读取这份配置
         run: |
           set -eux
-          python -u subscribe/process.py --config config.json --overwrite
+          python -u subscribe/process.py -c --overwrite
 
-      # 查看根目录是否产出了 clash.yaml
+      # ====== 列出产物，辅助排错 ======
       - name: List outputs
         run: |
           set -eux
