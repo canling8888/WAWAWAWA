@@ -25,8 +25,77 @@ jobs:
       - name: Install
         run: pip3 install -r requirements.txt
 
+      # 1) 自检：Secrets 存在
+      - name: Validate secrets (non-empty)
+        env:
+          GIST_LINK: ${{ secrets.GIST_LINK }}   # 必须是 Gist ID（不是 URL）
+          GIST_PAT:  ${{ secrets.GIST_PAT }}    # 必须有 Gists: Read & write
+        run: |
+          set -eux
+          test -n "$GIST_LINK" || (echo "GIST_LINK is empty"; exit 1)
+          test -n "$GIST_PAT"  || (echo "GIST_PAT is empty";  exit 1)
+
+      # 2) 自检：PAT 能访问该 Gist
+      - name: Check PAT can access Gist
+        env:
+          GIST_LINK: ${{ secrets.GIST_LINK }}
+          GIST_PAT:  ${{ secrets.GIST_PAT }}
+        run: |
+          set -eux
+          code=$(curl -s -o /dev/null -w "%{http_code}\n" \
+            -H "Authorization: token $GIST_PAT" \
+            "https://api.github.com/gists/$GIST_LINK")
+          echo "HTTP $code"
+          [ "$code" = "200" ] || (echo "PAT/GIST_LINK check failed"; exit 1)
+
+      # 3) 复制默认配置并注入 Gist 推送（产物: 根目录 clash.yaml）
+      - name: Build runtime config.json (inject push->gist)
+        env:
+          GIST_LINK: ${{ secrets.GIST_LINK }}
+          GIST_PAT:  ${{ secrets.GIST_PAT }}
+        run: |
+          set -eux
+          test -f subscribe/config/config.default.json
+
+          cat > inject.py <<'PY'
+import json, os
+with open('subscribe/config/config.default.json','r',encoding='utf-8') as f:
+    cfg = json.load(f)
+
+# 注入 storage -> gist；如产物路径不同，改 filename 即可
+cfg.setdefault('storage', {})
+cfg['storage']['engine'] = 'gist'
+cfg['storage']['base']   = 'https://api.github.com'
+cfg['storage']['domain'] = 'https://gist.github.com'
+cfg['storage']['token']  = os.environ['GIST_PAT']
+cfg['storage']['items']  = {
+    "xxx-clash": {"id": os.environ['GIST_LINK'], "filename": "clash.yaml"}
+}
+
+with open('config.json','w',encoding='utf-8') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+cfg['storage']['token'] = '***'
+print(json.dumps(cfg, ensure_ascii=False, indent=2))
+PY
+
+          python inject.py
+          rm -f inject.py
+
+      # 4) 用 SUBSCRIBE_CONF 指定这份配置（脚本不支持 --config）
       - name: Process
-        run: python -u subscribe/process.py --overwrite
+        env:
+          SUBSCRIBE_CONF: config.json
+        run: |
+          set -eux
+          python -u subscribe/process.py -c --overwrite
+
+      # 5) 列出产物，辅助确认
+      - name: List outputs
+        run: |
+          set -eux
+          ls -al
+          [ -f clash.yaml ] && echo "Found clash.yaml in repo root" || echo "No clash.yaml in repo root"
 
       - name: Timestamp
         run: date
