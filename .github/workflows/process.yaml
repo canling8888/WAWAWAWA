@@ -5,10 +5,6 @@ on:
     - cron: "05 03 * * *"
     - cron: "05 11 * * *"
 
-env:
-  # 产物文件路径；不在根目录就改这里（例如 build/clash.yaml）
-  OUTPUT_FILE: clash.yaml
-
 jobs:
   process:
     runs-on: ubuntu-latest
@@ -29,76 +25,8 @@ jobs:
       - name: Install
         run: pip3 install -r requirements.txt
 
-      - name: Install jq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
-
-      # 自检：Secrets 非空
-      - name: Validate secrets (non-empty)
-        env:
-          GIST_LINK: ${{ secrets.GIST_LINK }}   # 可填 ID 或完整 URL
-          GIST_PAT:  ${{ secrets.GIST_PAT }}    # 需要 Gists: Read & write
-        run: |
-          set -eux
-          test -n "$GIST_LINK" || (echo "GIST_LINK is empty"; exit 1)
-          test -n "$GIST_PAT"  || (echo "GIST_PAT is empty";  exit 1)
-
-      # 复制默认配置并注入 Gist 推送（匹配 storage.items["xxx-clash"]）
-      - name: Build runtime config.json (inject push->gist)
-        env:
-          GIST_LINK: ${{ secrets.GIST_LINK }}
-          GIST_PAT:  ${{ secrets.GIST_PAT }}
-          OUTPUT_FILE: ${{ env.OUTPUT_FILE }}
-        run: |
-          set -eux
-          test -f subscribe/config/config.default.json
-          cp subscribe/config/config.default.json config.json
-
-          # 支持 GIST_LINK=URL 或 ID，统一提取 ID
-          RAW="$GIST_LINK"
-          if echo "$RAW" | grep -qi '^http'; then
-            GID="$(echo "$RAW" | sed 's#/*$##' | awk -F/ '{print $NF}')"
-          else
-            GID="$RAW"
-          fi
-
-          # 注入 gist 推送；关键是把 items 里的 "xxx-clash" 指到 OUTPUT_FILE
-          jq --arg id "$GID" --arg tok "$GIST_PAT" --arg fn "$OUTPUT_FILE" '
-            .storage.engine = "gist" |
-            .storage.base   = "https://api.github.com" |
-            .storage.domain = "https://gist.github.com" |
-            .storage.token  = $tok |
-            .storage.items  = (
-              .storage.items // {} |
-              . + { "xxx-clash": { "id": $id, "filename": $fn } }
-            )
-          ' config.json > config.tmp && mv config.tmp config.json
-
-          echo "=== RESOLVED config.json (token redacted) ==="
-          jq '.storage.token="***" | .storage' config.json
-
-      # 用 SUBSCRIBE_CONF + -c 运行（脚本不支持 --config）
       - name: Process
-        env:
-          SUBSCRIBE_CONF: config.json
-        run: |
-          set -eux
-          python -u subscribe/process.py -c --overwrite
-
-      # 断言产物存在；如果路径不对会明确报错
-      - name: Verify output exists
-        env:
-          OUTPUT_FILE: ${{ env.OUTPUT_FILE }}
-        run: |
-          set -eux
-          if [ ! -f "$OUTPUT_FILE" ]; then
-            echo "ERROR: Output file not found: $OUTPUT_FILE"
-            echo "👉 如果脚本把文件写在别的目录，请改本文件顶部的 OUTPUT_FILE"
-            exit 1
-          fi
-          echo "Found: $OUTPUT_FILE"
-          ls -al "$OUTPUT_FILE"
+        run: python -u subscribe/process.py --overwrite
 
       - name: Timestamp
         run: date
