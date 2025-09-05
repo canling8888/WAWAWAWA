@@ -6,7 +6,7 @@ on:
     - cron: "05 11 * * *"
 
 env:
-  # 产物文件相对路径（如果不是根目录，请改成真实路径，例如 build/clash.yaml）
+  # 产物文件路径；不在根目录就改这里（例如 build/clash.yaml）
   OUTPUT_FILE: clash.yaml
 
 jobs:
@@ -29,6 +29,12 @@ jobs:
       - name: Install
         run: pip3 install -r requirements.txt
 
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      # 自检：Secrets 非空
       - name: Validate secrets (non-empty)
         env:
           GIST_LINK: ${{ secrets.GIST_LINK }}   # 可填 ID 或完整 URL
@@ -38,6 +44,7 @@ jobs:
           test -n "$GIST_LINK" || (echo "GIST_LINK is empty"; exit 1)
           test -n "$GIST_PAT"  || (echo "GIST_PAT is empty";  exit 1)
 
+      # 复制默认配置并注入 Gist 推送（匹配 storage.items["xxx-clash"]）
       - name: Build runtime config.json (inject push->gist)
         env:
           GIST_LINK: ${{ secrets.GIST_LINK }}
@@ -46,42 +53,32 @@ jobs:
         run: |
           set -eux
           test -f subscribe/config/config.default.json
+          cp subscribe/config/config.default.json config.json
 
-          # 生成注入脚本（务必保持下面行首无额外空格/中文字符）
-          cat > inject.py <<'PY'
-import json, os
+          # 支持 GIST_LINK=URL 或 ID，统一提取 ID
+          RAW="$GIST_LINK"
+          if echo "$RAW" | grep -qi '^http'; then
+            GID="$(echo "$RAW" | sed 's#/*$##' | awk -F/ '{print $NF}')"
+          else
+            GID="$RAW"
+          fi
 
-# 读取默认配置
-with open('subscribe/config/config.default.json','r',encoding='utf-8') as f:
-    cfg = json.load(f)
+          # 注入 gist 推送；关键是把 items 里的 "xxx-clash" 指到 OUTPUT_FILE
+          jq --arg id "$GID" --arg tok "$GIST_PAT" --arg fn "$OUTPUT_FILE" '
+            .storage.engine = "gist" |
+            .storage.base   = "https://api.github.com" |
+            .storage.domain = "https://gist.github.com" |
+            .storage.token  = $tok |
+            .storage.items  = (
+              .storage.items // {} |
+              . + { "xxx-clash": { "id": $id, "filename": $fn } }
+            )
+          ' config.json > config.tmp && mv config.tmp config.json
 
-# 解析 Gist ID：支持 ID 或完整 URL
-raw = os.environ['GIST_LINK'].strip()
-gid = raw.rstrip('/').split('/')[-1] if raw.startswith('http') else raw
+          echo "=== RESOLVED config.json (token redacted) ==="
+          jq '.storage.token="***" | .storage' config.json
 
-# 注入 storage -> gist
-cfg.setdefault('storage', {})
-cfg['storage']['engine']  = 'gist'
-cfg['storage']['base']    = 'https://api.github.com'
-cfg['storage']['domain']  = 'https://gist.github.com'
-cfg['storage']['token']   = os.environ['GIST_PAT']
-cfg['storage']['items']   = {
-    "xxx-clash": {"id": gid, "filename": os.environ['OUTPUT_FILE']}
-}
-
-# 写回运行时配置
-with open('config.json','w',encoding='utf-8') as f:
-    json.dump(cfg, f, ensure_ascii=False, indent=2)
-
-# 打码展示
-cfg['storage']['token'] = '***'
-print("=== RESOLVED config.json ===")
-print(json.dumps(cfg, ensure_ascii=False, indent=2))
-PY
-
-          python inject.py
-          rm -f inject.py
-
+      # 用 SUBSCRIBE_CONF + -c 运行（脚本不支持 --config）
       - name: Process
         env:
           SUBSCRIBE_CONF: config.json
@@ -89,6 +86,7 @@ PY
           set -eux
           python -u subscribe/process.py -c --overwrite
 
+      # 断言产物存在；如果路径不对会明确报错
       - name: Verify output exists
         env:
           OUTPUT_FILE: ${{ env.OUTPUT_FILE }}
@@ -96,7 +94,7 @@ PY
           set -eux
           if [ ! -f "$OUTPUT_FILE" ]; then
             echo "ERROR: Output file not found: $OUTPUT_FILE"
-            echo "If your script writes to another path, edit env.OUTPUT_FILE at top of this workflow."
+            echo "👉 如果脚本把文件写在别的目录，请改本文件顶部的 OUTPUT_FILE"
             exit 1
           fi
           echo "Found: $OUTPUT_FILE"
