@@ -1,23 +1,14 @@
 name: Process
 on:
+  workflow_dispatch:
   schedule:
     - cron: "05 03 * * *"
     - cron: "05 11 * * *"
-  workflow_dispatch:
-
-env:
-  TZ: Asia/Shanghai
-  SUBSCRIBE_CONF: ${{ secrets.SUBSCRIBE_CONF }}
-  PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
-  REACHABLE: ${{ vars.REACHABLE }}
-  SKIP_ALIVE_CHECK: ${{ vars.SKIP_ALIVE_CHECK }}
-  SKIP_REMARK: ${{ vars.SKIP_REMARK }}
-  WORKFLOW_MODE: ${{ vars.WORKFLOW_MODE }}
-  ENABLE_SPECIAL_PROTOCOLS: ${{ vars.ENABLE_SPECIAL_PROTOCOLS }}
 
 jobs:
   process:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,70 +25,8 @@ jobs:
       - name: Install
         run: pip3 install -r requirements.txt
 
-      # 检查 Secrets 是否存在
-      - name: Validate secrets (non-empty)
-        env:
-          GIST_LINK: ${{ secrets.GIST_LINK }}
-          GIST_PAT:  ${{ secrets.GIST_PAT }}
-        run: |
-          set -eux
-          test -n "$GIST_LINK" || (echo "GIST_LINK is empty"; exit 1)
-          test -n "$GIST_PAT"  || (echo "GIST_PAT is empty";  exit 1)
-          echo "GIST_LINK length: ${#GIST_LINK}"
-          echo "GIST_PAT   length: ${#GIST_PAT}"
-
-      # 用 PAT 测试是否能访问该 Gist（要求 GIST_LINK=ID）
-      - name: Check PAT can access Gist
-        env:
-          GIST_LINK: ${{ secrets.GIST_LINK }}
-          GIST_PAT:  ${{ secrets.GIST_PAT }}
-        run: |
-          set -eux
-          code=$(curl -s -o /dev/null -w "%{http_code}\n" \
-            -H "Authorization: token $GIST_PAT" \
-            "https://api.github.com/gists/$GIST_LINK")
-          echo "HTTP $code"
-          [ "$code" = "200" ] || (echo "PAT/GIST_LINK check failed"; exit 1)
-
-      # 用 Python 生成 config.json 并注入 Gist 推送配置（产物：根目录 clash.yaml）
-      - name: Build runtime config.json (inject push->gist)
-        env:
-          GIST_LINK: ${{ secrets.GIST_LINK }}
-          GIST_PAT:  ${{ secrets.GIST_PAT }}
-        run: |
-          set -eux
-          test -f subscribe/config/config.default.json
-          python - <<'PY'
-import json, os, sys
-with open('subscribe/config/config.default.json','r',encoding='utf-8') as f:
-    cfg = json.load(f)
-# 注入 storage->gist
-cfg.setdefault('storage', {})
-cfg['storage']['engine'] = 'gist'
-cfg['storage']['base']   = 'https://api.github.com'
-cfg['storage']['domain'] = 'https://gist.github.com'
-cfg['storage']['token']  = os.environ['GIST_PAT']
-cfg['storage']['items']  = {
-    "xxx-clash": {"id": os.environ['GIST_LINK'], "filename": "clash.yaml"}
-}
-with open('config.json','w',encoding='utf-8') as f:
-    json.dump(cfg, f, ensure_ascii=False, indent=2)
-print('config.json written (token redacted below):')
-tmp = json.loads(json.dumps(cfg))
-tmp['storage']['token'] = '***'
-print(json.dumps(tmp, ensure_ascii=False, indent=2))
-PY
-
       - name: Process
-        run: |
-          set -eux
-          python -u subscribe/process.py --config config.json --overwrite
-
-      - name: List outputs
-        run: |
-          set -eux
-          ls -al
-          [ -f clash.yaml ] && echo "Found clash.yaml in repo root" || echo "No clash.yaml in repo root"
+        run: python -u subscribe/process.py --overwrite
 
       - name: Timestamp
         run: date
