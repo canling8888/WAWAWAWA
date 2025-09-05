@@ -28,27 +28,14 @@ jobs:
       # 1) 自检：Secrets 存在
       - name: Validate secrets (non-empty)
         env:
-          GIST_LINK: ${{ secrets.GIST_LINK }}   # 必须是 Gist ID（不是 URL）
-          GIST_PAT:  ${{ secrets.GIST_PAT }}    # 必须有 Gists: Read & write
+          GIST_LINK: ${{ secrets.GIST_LINK }}
+          GIST_PAT:  ${{ secrets.GIST_PAT }}
         run: |
           set -eux
           test -n "$GIST_LINK" || (echo "GIST_LINK is empty"; exit 1)
           test -n "$GIST_PAT"  || (echo "GIST_PAT is empty";  exit 1)
 
-      # 2) 自检：PAT 能访问该 Gist
-      - name: Check PAT can access Gist
-        env:
-          GIST_LINK: ${{ secrets.GIST_LINK }}
-          GIST_PAT:  ${{ secrets.GIST_PAT }}
-        run: |
-          set -eux
-          code=$(curl -s -o /dev/null -w "%{http_code}\n" \
-            -H "Authorization: token $GIST_PAT" \
-            "https://api.github.com/gists/$GIST_LINK")
-          echo "HTTP $code"
-          [ "$code" = "200" ] || (echo "PAT/GIST_LINK check failed"; exit 1)
-
-      # 3) 复制默认配置并注入 Gist 推送（产物: 根目录 clash.yaml）
+      # 2) 生成运行时 config.json 并注入 Gist 推送（支持 GIST_LINK=ID 或 URL）
       - name: Build runtime config.json (inject push->gist)
         env:
           GIST_LINK: ${{ secrets.GIST_LINK }}
@@ -57,24 +44,37 @@ jobs:
           set -eux
           test -f subscribe/config/config.default.json
 
+          # 生成注入脚本（避免 here-doc 缩进/编码问题）
           cat > inject.py <<'PY'
-import json, os
+import json, os, re, sys
+
+# 读取默认配置
 with open('subscribe/config/config.default.json','r',encoding='utf-8') as f:
     cfg = json.load(f)
 
-# 注入 storage -> gist；如产物路径不同，改 filename 即可
+# 解析 Gist ID：既支持 ID，也支持整条 URL
+raw = os.environ['GIST_LINK'].strip()
+if raw.startswith('http'):
+    # 去掉末尾 '/', 取最后一段
+    gid = raw.rstrip('/').split('/')[-1]
+else:
+    gid = raw
+
+# 注入 storage -> gist；如果你的产物不在根目录，请改 filename
 cfg.setdefault('storage', {})
-cfg['storage']['engine'] = 'gist'
-cfg['storage']['base']   = 'https://api.github.com'
-cfg['storage']['domain'] = 'https://gist.github.com'
-cfg['storage']['token']  = os.environ['GIST_PAT']
-cfg['storage']['items']  = {
-    "xxx-clash": {"id": os.environ['GIST_LINK'], "filename": "clash.yaml"}
+cfg['storage']['engine']  = 'gist'
+cfg['storage']['base']    = 'https://api.github.com'
+cfg['storage']['domain']  = 'https://gist.github.com'
+cfg['storage']['token']   = os.environ['GIST_PAT']
+cfg['storage']['items']   = {
+    "xxx-clash": {"id": gid, "filename": "clash.yaml"}
 }
 
+# 写回运行时配置
 with open('config.json','w',encoding='utf-8') as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)
 
+# 打印（打码 token）
 cfg['storage']['token'] = '***'
 print(json.dumps(cfg, ensure_ascii=False, indent=2))
 PY
@@ -82,7 +82,7 @@ PY
           python inject.py
           rm -f inject.py
 
-      # 4) 用 SUBSCRIBE_CONF 指定这份配置（脚本不支持 --config）
+      # 3) 跑脚本（脚本用 SUBSCRIBE_CONF 指向我们生成的 config.json）
       - name: Process
         env:
           SUBSCRIBE_CONF: config.json
@@ -90,7 +90,7 @@ PY
           set -eux
           python -u subscribe/process.py -c --overwrite
 
-      # 5) 列出产物，辅助确认
+      # 4) 列出产物（看是否在根目录产出了 clash.yaml）
       - name: List outputs
         run: |
           set -eux
