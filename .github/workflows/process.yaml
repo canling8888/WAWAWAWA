@@ -35,22 +35,54 @@ jobs:
       - name: Install
         run: pip3 install -r requirements.txt
 
-      # === 在这里插入（新增） ===
-      - name: Install jq (for JSON editing)
+      # 安装 jq
+      - name: Install jq
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
 
-      - name: Build runtime config.json (inject push->gist)
+      # 先校验 Secrets 是否存在（不打印值）
+      - name: Validate secrets (non-empty)
         env:
-          GIST_LINK: ${{ secrets.GIST_LINK }}   # 建议填 Gist 的 ID（链接最后那段）
-          GIST_PAT:  ${{ secrets.GIST_PAT }}    # 需要 Gists: Read & write 权限
+          GIST_LINK: ${{ secrets.GIST_LINK }}
+          GIST_PAT:  ${{ secrets.GIST_PAT }}
         run: |
           set -eux
-          # 1) 复制默认配置
+          test -n "$GIST_LINK" || (echo "GIST_LINK is empty"; exit 1)
+          test -n "$GIST_PAT"  || (echo "GIST_PAT is empty";  exit 1)
+          echo "GIST_LINK length: ${#GIST_LINK}"
+          echo "GIST_PAT   length: ${#GIST_PAT}"
+
+      # 用 PAT 测试一下能否访问 Gist（200 才算通过）
+      - name: Check PAT can access Gist
+        env:
+          GIST_LINK: ${{ secrets.GIST_LINK }}
+          GIST_PAT:  ${{ secrets.GIST_PAT }}
+        run: |
+          set -eux
+          # 如果你填的是 ID，这里拼出 API；如果你填的是完整 URL，这个请求也会给 404。
+          # 建议 GIST_LINK 填“ID”（链接最后那串）。
+          curl -s -o /dev/null -w "%{http_code}\n" \
+            -H "Authorization: token $GIST_PAT" \
+            "https://api.github.com/gists/$GIST_LINK" | tee /tmp/code
+          code=$(cat /tmp/code)
+          if [ "$code" != "200" ]; then
+            echo "PAT/GIST_LINK check failed, http_code=$code"
+            exit 1
+          fi
+
+      # 生成运行时 config.json，并注入 gist 推送配置
+      - name: Build runtime config.json (inject push->gist)
+        env:
+          GIST_LINK: ${{ secrets.GIST_LINK }}
+          GIST_PAT:  ${{ secrets.GIST_PAT }}
+        run: |
+          set -eux
+          # 确保默认配置存在
+          test -f subscribe/config/config.default.json
+
           cp subscribe/config/config.default.json config.json
 
-          # 2) 注入 Gist 推送配置（产物在根目录：clash.yaml）
           jq --arg tok "${GIST_PAT}" --arg id "${GIST_LINK}" '
             .storage.engine = "gist" |
             .storage.base   = "https://api.github.com" |
@@ -61,13 +93,21 @@ jobs:
             }
           ' config.json > config.tmp && mv config.tmp config.json
 
-          echo "==== resolved storage (token redacted) ===="
+          echo "==== resolved config (token redacted) ===="
           sed -E 's/"token"\s*:\s*"[^"]+"/"token":"***"/' config.json
-      # === 插入结束 ===
 
+      # 真正运行脚本（显式携带 config）
       - name: Process
         run: |
+          set -eux
           python -u subscribe/process.py --config config.json --overwrite
+
+      # 查看根目录是否产出了 clash.yaml
+      - name: List outputs
+        run: |
+          set -eux
+          ls -al
+          [ -f clash.yaml ] && echo "Found clash.yaml in repo root" || echo "No clash.yaml in repo root"
 
       - name: Timestamp
         run: date
