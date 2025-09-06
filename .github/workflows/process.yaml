@@ -1,122 +1,105 @@
-name: Process
+name: run-process
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "05 03 * * *"
-    - cron: "05 11 * * *"
-
-permissions:
-  contents: read
-
-env:
-  # 产物文件名（process.py 会产出 clash.yaml）
-  OUTPUT_FILE: clash.yaml
+  workflow_dispatch: {}   # 手动触发
 
 jobs:
-  process:
+  run:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: main
 
-      - name: Prepare Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
-          architecture: "x64"
-          cache: "pip"
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install deps
-        run: pip3 install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      # ========= 核心：运行时生成 subscribe/config/config.json =========
-      - name: Inject runtime config (Gist storage + push_to)
-        env:
-          GIST_LINK: ${{ secrets.GIST_LINK }}   # 这里既可放 Gist 的 ID，也可放完整 URL
-          GIST_PAT:  ${{ secrets.GIST_PAT }}    # 需具备 “gist” scope 的 PAT
+      # 准备配置：默认模板复制为可编辑配置
+      - name: Prepare config
+        run: |
+          mkdir -p subscribe/config
+          cp subscribe/config/config.default.json subscribe/config/config.json
+
+      # 关键：这个仓库里 -c 是布尔开关，不能跟路径
+      - name: Run process
         shell: bash
         run: |
-          set -euo pipefail
-          cp -f subscribe/config/config.default.json subscribe/config/config.json
+          set -eux
+          python subscribe/process.py -c || python subscribe/process.py
 
-          python3 - << 'PY'
-          import json, os, sys, re
-
-          src = "subscribe/config/config.default.json"
-          dst = "subscribe/config/config.json"
-
-          with open(src, "r", encoding="utf-8") as f:
-              cfg = json.load(f)
-
-          gist_link = os.environ["GIST_LINK"].strip()
-          token     = os.environ["GIST_PAT"].strip()
-
-          # 提取 Gist ID（支持直接给 ID 或完整 URL）
-          m = re.search(r'([0-9a-f]{20,})$', gist_link, re.I)
-          gist_id = m.group(1) if m else gist_link
-
-          # 1) groups 里把输出目标指向我们新建的 gist 存储键
-          #（默认文件里有 groups.xxx.targets.clash/singbox/v2ray）
-          cfg.setdefault("groups", {}).setdefault("xxx", {}).setdefault("targets", {})
-          cfg["groups"]["xxx"]["targets"]["clash"]   = "gist-clash"
-          cfg["groups"]["xxx"]["targets"]["singbox"] = "gist-singbox"
-          cfg["groups"]["xxx"]["targets"]["v2ray"]   = "gist-v2ray"
-
-          # 2) 声明 storage = Gist，引擎/域名/鉴权等
-          cfg["storage"] = {
-              "engine": "gist",
-              "base": "https://api.github.com",
-              "domain": "https://gist.github.com",
-              # 有些实现读取 token/gistid 放在 storage 顶层或 items 下，这里两处都准备，增强兼容
-              "token": token,
-              "gistid": gist_id,
-              "items": {
-                  # 主要产物
-                  "gist-clash":    { "fileid": "clash.yaml",   "token": token, "gistid": gist_id },
-                  # 可选产物（如果你的流程会生成）
-                  "gist-singbox":  { "fileid": "singbox.json", "token": token, "gistid": gist_id },
-                  "gist-v2ray":    { "fileid": "v2ray.txt",    "token": token, "gistid": gist_id },
-                  # 爬取持久化（按你默认模板里的命名）
-                  "crawledsubs":   { "fileid": "crawledsubs.txt",  "token": token, "gistid": gist_id },
-                  "crawledproxies":{ "fileid": "crawledproxies.txt","token": token, "gistid": gist_id },
-              }
-          }
-
-          # 3) 各处 push_to → 指向我们上面声明的存储键
-          #    a) domains：把生成的订阅直接推到 clash（你也可改为数组包含多个）
-          for d in cfg.get("domains", []):
-              d["push_to"] = ["gist-clash"]
-
-          #    b) crawl：保持默认 persist 键位，并把各子模块的推送指向 crawledsubs
-          cfg.setdefault("crawl", {})
-          cfg["crawl"].setdefault("persist", {"subs": "crawledsubs", "proxies": "crawledproxies"})
-
-          for key in ["telegram", "google", "github", "twitter"]:
-              if key in cfg["crawl"] and isinstance(cfg["crawl"][key], dict):
-                  cfg["crawl"][key]["push_to"] = ["crawledsubs"]
-
-          for p in cfg["crawl"].get("pages", []):
-              p["push_to"] = ["crawledsubs"]
-
-          with open(dst, "w", encoding="utf-8") as f:
-              json.dump(cfg, f, ensure_ascii=False, indent=2)
-
-          print(f"[OK] wrote {dst}")
-          PY
-
-          echo "------ FINAL CONFIG PREVIEW ------"
-          sed -n '1,160p' subscribe/config/config.json
-
-      - name: Run process.py
+      # 打印目录，便于排查
+      - name: Inspect outputs
+        shell: bash
         run: |
-          python3 process.py
-          echo "Process finished. If success, artifact should have been pushed to your Gist."
-
-      - name: Show output file (if produced locally)
-        if: always()
-        run: |
+          echo "WORKSPACE=$(pwd)"
           ls -lah || true
-          [ -f "$OUTPUT_FILE" ] && head -n 50 "$OUTPUT_FILE" || true
+          ls -lah subscribe || true
+          ls -lah subscribe/out || true
+          ls -lah clash || true
+
+      # 自动定位“可运行的 Clash 配置”：
+      # 1) 优先常见成品路径
+      # 2) 否则在所有 *.yaml/*.yml 里挑“包含 proxies/proxy-providers/proxy-groups 顶层键”的，取体积最大的那个
+      - name: Locate runnable Clash YAML
+        id: locate
+        shell: bash
+        run: |
+          set -e
+          pick=""
+          # 优先候选
+          for p in clash/proxies-meta.yaml clash/proxies.yaml proxies-meta.yaml proxies.yaml subscribe/out/proxies.yaml; do
+            [ -f "$p" ] && { pick="$p"; break; }
+          done
+          # 自动筛选含关键段落的 YAML
+          if [ -z "$pick" ]; then
+            mapfile -t files < <(find . -type f \( -name "*.yaml" -o -name "*.yml" \) -print)
+            best_size=0
+            best_file=""
+            for f in "${files[@]}"; do
+              # 只认真正可导入 Clash 的文件
+              if grep -Eq '^(proxies|proxy-providers|proxy-groups):' "$f"; then
+                sz=$(wc -c < "$f")
+                if [ "$sz" -gt "$best_size" ]; then
+                  best_size=$sz
+                  best_file="$f"
+                fi
+              fi
+            done
+            pick="$best_file"
+          fi
+          pick="${pick#./}"
+          echo "file=$pick" >> "$GITHUB_OUTPUT"
+          echo "Picked runnable YAML: ${pick:-<none>}"
+
+      # 用官方 Action 更新到你的 Gist（文件名统一叫 clash.yaml）
+      - name: Update Gist via GitHub API
+        if: ${{ steps.locate.outputs.file != '' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GIST_PAT }}   # 你已有的 PAT（需 gist 权限）
+          script: |
+            const fs = require('fs');
+            const p = '${{ steps.locate.outputs.file }}';
+            const content = fs.readFileSync(p, 'utf8');
+            await github.request('PATCH /gists/{gist_id}', {
+              gist_id: process.env.GIST_ID,
+              files: { 'clash.yaml': { content } }
+            });
+        env:
+          GIST_ID: ${{ secrets.GIST_LINK }}       # 你已有的 Gist ID（注意是纯ID，不是整条URL）
+
+      # 打包所有 YAML（不管是不是最终成品），方便你下载对比
+      - name: Upload artifacts (all YAML)
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs
+          path: |
+            **/*.yaml
+            **/*.yml
+            subscribe/out/**
+          if-no-files-found: warn
