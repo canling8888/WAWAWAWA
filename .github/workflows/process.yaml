@@ -27,7 +27,6 @@ jobs:
       - name: Run process
         run: python subscribe/process.py -c subscribe/config/config.json
 
-      # 打印输出目录，确认产物路径
       - name: Inspect outputs
         run: |
           echo "WORKSPACE=$(pwd)"
@@ -36,17 +35,23 @@ jobs:
           ls -lah subscribe/out || true
           ls -lah clash || true
 
-      # 把生成的 clash/proxies.yaml 推到同一个 Gist（文件名为 proxies.yaml）
-      - name: Update Gist (proxies.yaml)
+      # 用官方脚本 Action 调 GitHub API 更新 Gist
+      - name: Update Gist via GitHub API (official action)
         if: hashFiles('clash/proxies.yaml') != ''
-        uses: peter-evans/create-or-update-gist@v3
+        uses: actions/github-script@v7
         with:
-          token: ${{ secrets.GIST_PAT }}
-          gist-id: ${{ secrets.GIST_LINK }}
-          files: |
-            proxies.yaml=clash/proxies.yaml
+          github-token: ${{ secrets.GIST_PAT }}
+          script: |
+            const fs = require('fs');
+            const path = 'clash/proxies.yaml';          // 如果产物路径不同，改这里
+            const content = fs.readFileSync(path, 'utf8');
+            await github.request('PATCH /gists/{gist_id}', {
+              gist_id: process.env.GIST_ID,
+              files: { 'proxies.yaml': { content } }    // Gist 里的文件名
+            });
+        env:
+          GIST_ID: ${{ secrets.GIST_LINK }}
 
-      # 同时把所有产物打包成 Artifact 方便下载
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
