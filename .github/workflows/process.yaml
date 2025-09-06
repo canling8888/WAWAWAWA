@@ -1,14 +1,42 @@
-name: run-process
+name: Process
+
 on:
-  workflow_dispatch: {}   # 手动触发
+  workflow_dispatch:
+    inputs:
+      skip_alive_check:
+        description: 'Skip liveness check for first runs (true/false)'
+        required: false
+        default: 'true'
+  schedule:
+    # 北京/台北时区(+08:00)：每天 11:05 和 19:05 跑
+    - cron: '05 03 * * *'
+    - cron: '05 11 * * *'
 
 jobs:
-  run:
+  process:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # —— 这些来自你仓库的 Variables/Secrets ——
+      GH_USERNAME: ${{ vars.GH_USERNAME }}
+      GIST_ID: ${{ vars.GIST_ID }}
+      GIST_PAT: ${{ secrets.GIST_PAT }}
+
+      # 首次建议跳过存活检测，稳妥产出；后续你可改为 false
+      SKIP_ALIVE_CHECK: ${{ github.event.inputs.skip_alive_check || 'true' }}
+
+      # 目标文件名（可以改）
+      CLASH_FILE: clash.yaml
+      SINGBOX_FILE: singbox.json
+      V2RAY_FILE: v2ray.txt
+      CRAWLED_SUBS_FILE: crawledsubs.txt
+      CRAWLED_PROXIES_FILE: crawledproxies.txt
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -16,90 +44,186 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install deps
-        run: pip install -r requirements.txt
-
-      # 准备配置：默认模板复制为可编辑配置
-      - name: Prepare config
+      - name: Install dependencies
         run: |
-          mkdir -p subscribe/config
-          cp subscribe/config/config.default.json subscribe/config/config.json
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      # 关键：这个仓库里 -c 是布尔开关，不能跟路径
-      - name: Run process
+      - name: Generate config.json (inline, based on your template)
         shell: bash
         run: |
-          set -eux
-          python subscribe/process.py -c || python subscribe/process.py
-
-      # 打印目录，便于排查
-      - name: Inspect outputs
-        shell: bash
-        run: |
-          echo "WORKSPACE=$(pwd)"
-          ls -lah || true
-          ls -lah subscribe || true
-          ls -lah subscribe/out || true
-          ls -lah clash || true
-
-      # 自动定位“可运行的 Clash 配置”：
-      # 1) 优先常见成品路径
-      # 2) 否则在所有 *.yaml/*.yml 里挑“包含 proxies/proxy-providers/proxy-groups 顶层键”的，取体积最大的那个
-      - name: Locate runnable Clash YAML
-        id: locate
-        shell: bash
-        run: |
-          set -e
-          pick=""
-          # 优先候选
-          for p in clash/proxies-meta.yaml clash/proxies.yaml proxies-meta.yaml proxies.yaml subscribe/out/proxies.yaml; do
-            [ -f "$p" ] && { pick="$p"; break; }
-          done
-          # 自动筛选含关键段落的 YAML
-          if [ -z "$pick" ]; then
-            mapfile -t files < <(find . -type f \( -name "*.yaml" -o -name "*.yml" \) -print)
-            best_size=0
-            best_file=""
-            for f in "${files[@]}"; do
-              # 只认真正可导入 Clash 的文件
-              if grep -Eq '^(proxies|proxy-providers|proxy-groups):' "$f"; then
-                sz=$(wc -c < "$f")
-                if [ "$sz" -gt "$best_size" ]; then
-                  best_size=$sz
-                  best_file="$f"
-                fi
-              fi
-            done
-            pick="$best_file"
+          if [ -z "$GH_USERNAME" ] || [ -z "$GIST_ID" ]; then
+            echo "GH_USERNAME or GIST_ID is empty. Set repository Variables first."
+            exit 1
           fi
-          pick="${pick#./}"
-          echo "file=$pick" >> "$GITHUB_OUTPUT"
-          echo "Picked runnable YAML: ${pick:-<none>}"
 
-      # 用官方 Action 更新到你的 Gist（文件名统一叫 clash.yaml）
-      - name: Update Gist via GitHub API
-        if: ${{ steps.locate.outputs.file != '' }}
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GIST_PAT }}   # 你已有的 PAT（需 gist 权限）
-          script: |
-            const fs = require('fs');
-            const p = '${{ steps.locate.outputs.file }}';
-            const content = fs.readFileSync(p, 'utf8');
-            await github.request('PATCH /gists/{gist_id}', {
-              gist_id: process.env.GIST_ID,
-              files: { 'clash.yaml': { content } }
-            });
-        env:
-          GIST_ID: ${{ secrets.GIST_LINK }}       # 你已有的 Gist ID（注意是纯ID，不是整条URL）
+          cat > config.json <<EOF
+          {
+            "domains": [],
+            "crawl": {
+              "enable": true,
+              "exclude": "",
+              "threshold": 5,
+              "singlelink": true,
+              "persist": {
+                "subs": "crawledsubs",
+                "proxies": "crawledproxies"
+              },
+              "config": {
+                "rename": "",
+                "include": "",
+                "exclude": ""
+              },
+              "telegram": {
+                "enable": false,
+                "pages": 5,
+                "exclude": "",
+                "users": {
+                  "channel": {
+                    "include": "",
+                    "exclude": "",
+                    "config": {
+                      "rename": ""
+                    },
+                    "push_to": []
+                  }
+                }
+              },
+              "google": {
+                "enable": false,
+                "exclude": "",
+                "notinurl": [],
+                "push_to": []
+              },
+              "github": {
+                "enable": true,
+                "pages": 2,
+                "push_to": ["xxx-clash"],
+                "exclude": "",
+                "spams": []
+              },
+              "twitter": {
+                "enable": false,
+                "users": {
+                  "username": {
+                    "enable": true,
+                    "num": 30,
+                    "include": "",
+                    "exclude": "",
+                    "config": {
+                      "rename": ""
+                    },
+                    "push_to": []
+                  }
+                }
+              },
+              "repositories": [
+                {
+                  "enable": false,
+                  "username": "",
+                  "repo_name": "",
+                  "commits": 3,
+                  "exclude": "",
+                  "push_to": []
+                }
+              ],
+              "pages": [
+                {
+                  "enable": false,
+                  "url": "",
+                  "include": "",
+                  "exclude": "",
+                  "config": {
+                    "rename": ""
+                  },
+                  "push_to": []
+                }
+              ],
+              "scripts": [
+                {
+                  "enable": false,
+                  "script": "file#function",
+                  "params": {
+                    "persist": {
+                      "fileid": ""
+                    },
+                    "any": "xxx",
+                    "config": {
+                      "enable": true,
+                      "liveness": true,
+                      "exclude": "",
+                      "rename": "",
+                      "push_to": []
+                    }
+                  }
+                }
+              ]
+            },
+            "groups": {
+              "xxx": {
+                "emoji": true,
+                "list": true,
+                "targets": {
+                  "clash": "xxx-clash"
+                },
+                "regularize": {
+                  "enable": false,
+                  "locate": true,
+                  "bits": 2
+                }
+              }
+            },
+            "storage": {
+              "engine": "gist",
+              "base": "https://api.github.com",
+              "domain": "https://gist.github.com",
+              "items": {
+                "xxx-clash": {
+                  "username": "${GH_USERNAME}",
+                  "gistid": "${GIST_ID}",
+                  "fileid": "${CLASH_FILE}"
+                },
+                "crawledsubs": {
+                  "username": "${GH_USERNAME}",
+                  "gistid": "${GIST_ID}",
+                  "fileid": "${CRAWLED_SUBS_FILE}"
+                },
+                "crawledproxies": {
+                  "username": "${GH_USERNAME}",
+                  "gistid": "${GIST_ID}",
+                  "fileid": "${CRAWLED_PROXIES_FILE}"
+                }
+              }
+            },
+            "update": {
+              "remark": true
+            },
+            "delay": 5000
+          }
+          EOF
 
-      # 打包所有 YAML（不管是不是最终成品），方便你下载对比
-      - name: Upload artifacts (all YAML)
+          echo "config.json generated:"
+          cat config.json
+
+      - name: Create .env for token
+        run: |
+          cat > .env <<EOF
+          GIST_PAT=${GIST_PAT}
+          SKIP_ALIVE_CHECK=${SKIP_ALIVE_CHECK}
+          EOF
+          echo ".env created"
+
+      - name: Run process.py
+        run: |
+          set -euxo pipefail
+          python process.py --server ./config.json --overwrite --num 64 --timeout 5000 --url https://www.google.com/generate_204
+
+      - name: Upload local outputs for debugging (if any)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: outputs
+          name: process-local-artifacts
           path: |
-            **/*.yaml
-            **/*.yml
-            subscribe/out/**
-          if-no-files-found: warn
+            data/**
+            subconverter/**
+          if-no-files-found: ignore
