@@ -5,10 +5,13 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -24,7 +27,7 @@ jobs:
       - name: Run process
         run: python subscribe/process.py -c subscribe/config/config.json
 
-      # 打印一下生成位置，方便确认路径
+      # 打印输出目录，确认产物路径
       - name: Inspect outputs
         run: |
           echo "WORKSPACE=$(pwd)"
@@ -33,25 +36,17 @@ jobs:
           ls -lah subscribe/out || true
           ls -lah clash || true
 
-      # 如果生成了 clash/proxies.yaml，就推到 Gist
+      # 把生成的 clash/proxies.yaml 推到同一个 Gist（文件名为 proxies.yaml）
       - name: Update Gist (proxies.yaml)
         if: hashFiles('clash/proxies.yaml') != ''
         uses: peter-evans/create-or-update-gist@v3
         with:
           token: ${{ secrets.GIST_PAT }}
           gist-id: ${{ secrets.GIST_LINK }}
-          files: proxies.yaml=clash/proxies.yaml
+          files: |
+            proxies.yaml=clash/proxies.yaml
 
-      # 你也可以把其它产物一起推（按需打开/改名）
-    - name: Update Gist (proxies.yaml)
-  if: hashFiles('clash/proxies.yaml') != ''
-  uses: peter-evans/create-or-update-gist@v3
-  with:
-    token: ${{ secrets.GIST_PAT }}     # 你已有的 PAT
-    gist-id: ${{ secrets.GIST_LINK }}  # 你已有的 Gist ID
-    files: proxies.yaml=clash/proxies.yaml
-
-
+      # 同时把所有产物打包成 Artifact 方便下载
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
