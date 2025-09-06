@@ -19,14 +19,19 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
+      # 准备配置文件（脚本默认会从 subscribe/config/config.json 读取）
       - name: Prepare config
         run: |
           mkdir -p subscribe/config
           cp subscribe/config/config.default.json subscribe/config/config.json
 
+      # 关键修复：-c 不接路径；失败则退回无 -c 运行
       - name: Run process
-        run: python subscribe/process.py -c subscribe/config/config.json
+        run: |
+          set -eux
+          python subscribe/process.py -c || python subscribe/process.py
 
+      # 打印目录，确认产物到底在哪
       - name: Inspect outputs
         run: |
           echo "WORKSPACE=$(pwd)"
@@ -35,23 +40,38 @@ jobs:
           ls -lah subscribe/out || true
           ls -lah clash || true
 
-      # 用官方脚本 Action 调 GitHub API 更新 Gist
-      - name: Update Gist via GitHub API (official action)
-        if: hashFiles('clash/proxies.yaml') != ''
+      # 自动定位一个最可能的成品（优先 clash/proxies.yaml，其次根目录 proxies.yaml）
+      - name: Locate output file
+        id: locate
+        shell: bash
+        run: |
+          if [ -f "clash/proxies.yaml" ]; then
+            echo "file=clash/proxies.yaml" >> $GITHUB_OUTPUT
+          elif [ -f "proxies.yaml" ]; then
+            echo "file=proxies.yaml" >> $GITHUB_OUTPUT
+          else
+            echo "file=" >> $GITHUB_OUTPUT
+          fi
+          echo "Located file: ${OUT:-<none>}"
+
+      # 用官方 Action 直接调 GitHub API 更新同一个 Gist（更稳）
+      - name: Update Gist via GitHub API
+        if: steps.locate.outputs.file != ''
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GIST_PAT }}
+          github-token: ${{ secrets.GIST_PAT }}  # 你已有的 PAT（需 gist 权限）
           script: |
             const fs = require('fs');
-            const path = 'clash/proxies.yaml';          // 如果产物路径不同，改这里
-            const content = fs.readFileSync(path, 'utf8');
+            const p = '${{ steps.locate.outputs.file }}';
+            const content = fs.readFileSync(p, 'utf8');
             await github.request('PATCH /gists/{gist_id}', {
               gist_id: process.env.GIST_ID,
-              files: { 'proxies.yaml': { content } }    // Gist 里的文件名
+              files: { 'proxies.yaml': { content } }  // Gist 里的文件名
             });
         env:
-          GIST_ID: ${{ secrets.GIST_LINK }}
+          GIST_ID: ${{ secrets.GIST_LINK }}      # 你已有的 Gist ID（不是整条URL）
 
+      # 打包所有产物，方便你从 Actions 页面下载
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
