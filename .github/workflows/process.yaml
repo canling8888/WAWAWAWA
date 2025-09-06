@@ -43,13 +43,14 @@ jobs:
           files: proxies.yaml=clash/proxies.yaml
 
       # 你也可以把其它产物一起推（按需打开/改名）
-      # - name: Update Gist (list.txt)
-      #   if: hashFiles('subscribe/out/list.txt') != ''
-      #   uses: peter-evans/create-or-update-gist@v3
-      #   with:
-      #     token: ${{ secrets.GIST_PAT }}
-      #     gist-id: ${{ secrets.GIST_LINK }}
-      #     files: list.txt=subscribe/out/list.txt
+    - name: Update Gist (proxies.yaml)
+  if: hashFiles('clash/proxies.yaml') != ''
+  uses: peter-evans/create-or-update-gist@v3
+  with:
+    token: ${{ secrets.GIST_PAT }}     # 你已有的 PAT
+    gist-id: ${{ secrets.GIST_LINK }}  # 你已有的 Gist ID
+    files: proxies.yaml=clash/proxies.yaml
+
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
