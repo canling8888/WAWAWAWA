@@ -1,115 +1,122 @@
-name: run-process
+name: Process
 on:
-  workflow_dispatch: {}   # 手动触发
+  workflow_dispatch:
+  schedule:
+    - cron: "05 03 * * *"
+    - cron: "05 11 * * *"
+
+permissions:
+  contents: read
+
+env:
+  # 产物文件名（process.py 会产出 clash.yaml）
+  OUTPUT_FILE: clash.yaml
 
 jobs:
-  run:
+  process:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
 
-      - name: Setup Python
+      - name: Prepare Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.x"
+          architecture: "x64"
+          cache: "pip"
 
       - name: Install deps
-        run: pip install -r requirements.txt
+        run: pip3 install -r requirements.txt
 
-      - name: Prepare config
-        run: |
-          mkdir -p subscribe/config
-          cp subscribe/config/config.default.json subscribe/config/config.json
-
-      # 这个仓库的 -c 是布尔开关，不能跟路径
-      - name: Run process
-        shell: bash
-        run: |
-          set -eux
-          python subscribe/process.py -c || python subscribe/process.py
-
-      - name: Inspect outputs
-        shell: bash
-        run: |
-          echo "WORKSPACE=$(pwd)"
-          ls -lah || true
-          ls -lah subscribe || true
-          ls -lah subscribe/out || true
-          ls -lah clash || true
-
-      # 自动挑一个最合适的 YAML 产物
-      - name: Locate YAML output
-        id: locate
-        shell: bash
-        run: |
-          set -e
-          pick=""
-          for p in clash/proxies.yaml proxies.yaml subscribe/out/clash.yaml subscribe/out/proxies.yaml; do
-            [ -f "$p" ] && { pick="$p"; break; }
-          done
-          [ -z "$pick" ] && pick=$(find . -type f \( -name "*.yaml" -o -name "*.yml" \) -printf "%T@ %p\n" | sort -nr | head -n 1 | cut -d' ' -f2- || true)
-          pick="${pick#./}"
-          echo "file=$pick" >> "$GITHUB_OUTPUT"
-          echo "Picked file: ${pick:-<none>}"
-
-      # 先尝试 PATCH 你提供的 Gist；404 则自动新建，并把新 ID 保存出来
-      - name: Upsert Gist (update or create)
-        id: upsert
-        if: ${{ steps.locate.outputs.file != '' }}
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GIST_PAT }}
-          script: |
-            const fs = require('fs');
-            const path = '${{ steps.locate.outputs.file }}';
-            const content = fs.readFileSync(path, 'utf8');
-            const gistId = (process.env.GIST_ID || '').trim();
-
-            async function update() {
-              return await github.request('PATCH /gists/{gist_id}', {
-                gist_id: gistId,
-                files: { 'clash.yaml': { content } }
-              });
-            }
-
-            try {
-              if (gistId) {
-                await update();
-                core.info(`Updated existing gist ${gistId}`);
-                return;
-              }
-            } catch (e) {
-              if (e.status !== 404) throw e;
-              core.warning('Gist not found or no access; creating a new secret gist.');
-            }
-
-            const resp = await github.request('POST /gists', {
-              public: false,
-              description: 'Auto-created by run-process workflow',
-              files: { 'clash.yaml': { content } }
-            });
-            const newId = resp.data.id;
-            fs.writeFileSync('NEW_GIST_ID.txt', newId);
-            core.setOutput('new_id', newId);
+      # ========= 核心：运行时生成 subscribe/config/config.json =========
+      - name: Inject runtime config (Gist storage + push_to)
         env:
-          GIST_ID: ${{ secrets.GIST_LINK }}
+          GIST_LINK: ${{ secrets.GIST_LINK }}   # 这里既可放 Gist 的 ID，也可放完整 URL
+          GIST_PAT:  ${{ secrets.GIST_PAT }}    # 需具备 “gist” scope 的 PAT
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -f subscribe/config/config.default.json subscribe/config/config.json
 
-      - name: Upload new gist id (if created)
-        if: ${{ steps.upsert.outputs.new_id != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: new-gist-id
-          path: NEW_GIST_ID.txt
+          python3 - << 'PY'
+          import json, os, sys, re
 
-      - name: Upload artifacts (all YAML)
-        uses: actions/upload-artifact@v4
-        with:
-          name: outputs
-          path: |
-            **/*.yaml
-            **/*.yml
-            subscribe/out/**
-          if-no-files-found: warn
+          src = "subscribe/config/config.default.json"
+          dst = "subscribe/config/config.json"
+
+          with open(src, "r", encoding="utf-8") as f:
+              cfg = json.load(f)
+
+          gist_link = os.environ["GIST_LINK"].strip()
+          token     = os.environ["GIST_PAT"].strip()
+
+          # 提取 Gist ID（支持直接给 ID 或完整 URL）
+          m = re.search(r'([0-9a-f]{20,})$', gist_link, re.I)
+          gist_id = m.group(1) if m else gist_link
+
+          # 1) groups 里把输出目标指向我们新建的 gist 存储键
+          #（默认文件里有 groups.xxx.targets.clash/singbox/v2ray）
+          cfg.setdefault("groups", {}).setdefault("xxx", {}).setdefault("targets", {})
+          cfg["groups"]["xxx"]["targets"]["clash"]   = "gist-clash"
+          cfg["groups"]["xxx"]["targets"]["singbox"] = "gist-singbox"
+          cfg["groups"]["xxx"]["targets"]["v2ray"]   = "gist-v2ray"
+
+          # 2) 声明 storage = Gist，引擎/域名/鉴权等
+          cfg["storage"] = {
+              "engine": "gist",
+              "base": "https://api.github.com",
+              "domain": "https://gist.github.com",
+              # 有些实现读取 token/gistid 放在 storage 顶层或 items 下，这里两处都准备，增强兼容
+              "token": token,
+              "gistid": gist_id,
+              "items": {
+                  # 主要产物
+                  "gist-clash":    { "fileid": "clash.yaml",   "token": token, "gistid": gist_id },
+                  # 可选产物（如果你的流程会生成）
+                  "gist-singbox":  { "fileid": "singbox.json", "token": token, "gistid": gist_id },
+                  "gist-v2ray":    { "fileid": "v2ray.txt",    "token": token, "gistid": gist_id },
+                  # 爬取持久化（按你默认模板里的命名）
+                  "crawledsubs":   { "fileid": "crawledsubs.txt",  "token": token, "gistid": gist_id },
+                  "crawledproxies":{ "fileid": "crawledproxies.txt","token": token, "gistid": gist_id },
+              }
+          }
+
+          # 3) 各处 push_to → 指向我们上面声明的存储键
+          #    a) domains：把生成的订阅直接推到 clash（你也可改为数组包含多个）
+          for d in cfg.get("domains", []):
+              d["push_to"] = ["gist-clash"]
+
+          #    b) crawl：保持默认 persist 键位，并把各子模块的推送指向 crawledsubs
+          cfg.setdefault("crawl", {})
+          cfg["crawl"].setdefault("persist", {"subs": "crawledsubs", "proxies": "crawledproxies"})
+
+          for key in ["telegram", "google", "github", "twitter"]:
+              if key in cfg["crawl"] and isinstance(cfg["crawl"][key], dict):
+                  cfg["crawl"][key]["push_to"] = ["crawledsubs"]
+
+          for p in cfg["crawl"].get("pages", []):
+              p["push_to"] = ["crawledsubs"]
+
+          with open(dst, "w", encoding="utf-8") as f:
+              json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+          print(f"[OK] wrote {dst}")
+          PY
+
+          echo "------ FINAL CONFIG PREVIEW ------"
+          sed -n '1,160p' subscribe/config/config.json
+
+      - name: Run process.py
+        run: |
+          python3 process.py
+          echo "Process finished. If success, artifact should have been pushed to your Gist."
+
+      - name: Show output file (if produced locally)
+        if: always()
+        run: |
+          ls -lah || true
+          [ -f "$OUTPUT_FILE" ] && head -n 50 "$OUTPUT_FILE" || true
