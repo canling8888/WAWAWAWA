@@ -1,32 +1,62 @@
-name: Process
+name: run-process
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "05 03 * * *"
-    - cron: "05 11 * * *"
+  workflow_dispatch: {}   # 手动触发
 
 jobs:
-  process:
+  run:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          ref: main
+          python-version: '3.11'
+          cache: 'pip'
 
-      - name: Prepare
-        uses: actions/setup-python@v5
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Prepare config
+        run: |
+          mkdir -p subscribe/config
+          cp subscribe/config/config.default.json subscribe/config/config.json
+
+      - name: Run process
+        run: python subscribe/process.py -c subscribe/config/config.json
+
+      # 打印一下生成位置，方便确认路径
+      - name: Inspect outputs
+        run: |
+          echo "WORKSPACE=$(pwd)"
+          ls -lah || true
+          ls -lah subscribe || true
+          ls -lah subscribe/out || true
+          ls -lah clash || true
+
+      # 如果生成了 clash/proxies.yaml，就推到 Gist
+      - name: Update Gist (proxies.yaml)
+        if: hashFiles('clash/proxies.yaml') != ''
+        uses: peter-evans/create-or-update-gist@v3
         with:
-          python-version: "3.x"
-          architecture: "x64"
-          cache: "pip"
+          token: ${{ secrets.GIST_PAT }}
+          gist-id: ${{ secrets.GIST_LINK }}
+          files: proxies.yaml=clash/proxies.yaml
 
-      - name: Install
-        run: pip3 install -r requirements.txt
+      # 你也可以把其它产物一起推（按需打开/改名）
+      # - name: Update Gist (list.txt)
+      #   if: hashFiles('subscribe/out/list.txt') != ''
+      #   uses: peter-evans/create-or-update-gist@v3
+      #   with:
+      #     token: ${{ secrets.GIST_PAT }}
+      #     gist-id: ${{ secrets.GIST_LINK }}
+      #     files: list.txt=subscribe/out/list.txt
 
-      - name: Process
-        run: python -u subscribe/process.py --overwrite
-
-      - name: Timestamp
-        run: date
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs
+          path: |
+            subscribe/out/**
+            clash/**/*.yaml
+            **/proxies.yaml
+          if-no-files-found: warn
